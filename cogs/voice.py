@@ -27,10 +27,14 @@ class Voice(commands.Cog, name="voice"):
         self.bot = bot
         # ギルドごとの時報タスクを管理
         self._hourly_tasks: Dict[int, asyncio.Task] = {}
+        # 次の正時に1回だけ再生するワンショットタスク
+        self._oneshot_tasks: Dict[int, asyncio.Task] = {}
 
     def cog_unload(self) -> None:
         # Cog unload 時に全タスクを停止
         for task in self._hourly_tasks.values():
+            task.cancel()
+        for task in self._oneshot_tasks.values():
             task.cancel()
 
     @staticmethod
@@ -107,6 +111,96 @@ class Voice(commands.Cog, name="voice"):
         if task:
             task.cancel()
 
+    async def _wait_and_play_once(self, guild_id: int, notify_channel_id: Optional[int]) -> None:
+        """次の正時まで待機して、対応する wav を1回だけ再生する。
+        再生可否はその時点の接続状態に依存（未接続ならスキップ）。
+        実行後は oneshot タスク登録をクリーンアップ。
+        """
+        try:
+            now = datetime.now()
+            next_top = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+            await asyncio.sleep(max(0.0, (next_top - now).total_seconds()))
+
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                return
+            voice_client: Optional[discord.VoiceClient] = guild.voice_client  # type: ignore[attr-defined]
+
+            if not voice_client or not voice_client.is_connected():
+                # 接続していないので今回はスキップ
+                if notify_channel_id:
+                    channel = self.bot.get_channel(notify_channel_id)
+                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                        try:
+                            await channel.send("指定時刻になりましたが、ボイスチャンネルに接続していないため再生をスキップしました。/start で接続してください。")
+                        except Exception:
+                            pass
+                return
+
+            # 既に再生中ならスキップ
+            if voice_client.is_playing() or voice_client.is_paused():
+                return
+
+            hour = datetime.now().hour  # 正時になっている想定
+            filename = self._hour_to_filename(hour)
+            path = AUDIO_DIR / filename
+            if not path.exists():
+                self.bot.logger.warning(self._fmt_missing(path))
+                if notify_channel_id:
+                    channel = self.bot.get_channel(notify_channel_id)
+                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                        try:
+                            await channel.send(self._fmt_missing(path))
+                        except Exception:
+                            pass
+                return
+
+            try:
+                source = discord.FFmpegPCMAudio(str(path))
+            except Exception as e:
+                self.bot.logger.error(f"FFmpeg 初期化に失敗しました: {e}")
+                if notify_channel_id:
+                    channel = self.bot.get_channel(notify_channel_id)
+                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                        try:
+                            await channel.send(f"FFmpeg 初期化に失敗しました: {e}")
+                        except Exception:
+                            pass
+                return
+
+            try:
+                voice_client.play(source)
+                if notify_channel_id:
+                    channel = self.bot.get_channel(notify_channel_id)
+                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                        try:
+                            await channel.send(f"{hour}時の時報を再生します。")
+                        except Exception:
+                            pass
+            except Exception as e:
+                self.bot.logger.error(f"音声再生に失敗しました: {e}")
+                if notify_channel_id:
+                    channel = self.bot.get_channel(notify_channel_id)
+                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                        try:
+                            await channel.send(f"音声再生に失敗しました: {e}")
+                        except Exception:
+                            pass
+                return
+
+            while voice_client.is_playing():
+                await asyncio.sleep(0.5)
+        finally:
+            # タスク終了時にクリア
+            self._oneshot_tasks.pop(guild_id, None)
+
+    def _schedule_oneshot(self, guild_id: int, notify_channel_id: Optional[int]) -> None:
+        # 既存があれば置き換え
+        prev = self._oneshot_tasks.pop(guild_id, None)
+        if prev:
+            prev.cancel()
+        self._oneshot_tasks[guild_id] = asyncio.create_task(self._wait_and_play_once(guild_id, notify_channel_id))
+
     @commands.hybrid_command(name="start", description="あなたがいるボイスチャンネルに参加します（毎正時に時報を流します）")
     @commands.guild_only()
     async def start(self, ctx: Context) -> None:
@@ -167,6 +261,62 @@ class Voice(commands.Cog, name="voice"):
             if ctx.guild:
                 self._cancel_hourly_task(ctx.guild.id)
 
+    @commands.hybrid_command(name="test", description="次の時間の音声を今すぐ一度だけ再生します（必要なら接続します）")
+    @commands.guild_only()
+    async def test(self, ctx: Context) -> None:
+        """Play the next hour's chime immediately, once.
+        - Connects to your current voice channel if not connected yet in this guild.
+        - Does not move if already connected to a different channel.
+        - Stops current playback if any, then plays the corresponding wav immediately.
+        """
+        author = ctx.author
+        if not isinstance(author, (discord.Member,)):
+            await ctx.send("このコマンドはサーバー内でのみ使用できます。")
+            return
 
-def setup(bot):
-    bot.add_cog(Voice(bot))
+        # Ensure connection
+        voice_client: Optional[discord.VoiceClient] = ctx.voice_client
+        if not voice_client or not voice_client.is_connected():
+            if not author.voice or not author.voice.channel:
+                await ctx.send("まず先にボイスチャンネルに参加してください。")
+                return
+            destination: discord.VoiceChannel | discord.StageChannel = author.voice.channel
+            try:
+                await destination.connect()
+                await ctx.send(f"{destination.mention} に参加しました。")
+            except discord.Forbidden:
+                await ctx.send("接続する権限がありません。ボットに『接続』と『発言』権限があるか確認してください。")
+                return
+            except discord.ClientException as e:
+                await ctx.send(f"ボイス接続中にエラーが発生しました: {e}")
+                return
+            voice_client = ctx.voice_client
+
+        if not voice_client or not voice_client.is_connected():
+            await ctx.send("ボイスチャンネルへの接続に失敗しました。")
+            return
+
+        # Determine next hour and audio file
+        now = datetime.now()
+        next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).hour
+        filename = self._hour_to_filename(next_hour)
+        path = AUDIO_DIR / filename
+        if not path.exists():
+            await ctx.send(self._fmt_missing(path))
+            return
+
+        # Stop current playback if any, then play immediately
+        try:
+            if voice_client.is_playing() or voice_client.is_paused():
+                voice_client.stop()
+            source = discord.FFmpegPCMAudio(str(path))
+            voice_client.play(source)
+            await ctx.send(f"{next_hour}時の時報を再生します。ファイル: `{filename}`")
+        except Exception as e:
+            await ctx.send(f"音声再生に失敗しました: {e}")
+            self.bot.logger.error(f"test: 音声再生に失敗: {e}")
+            return
+
+
+async def setup(bot):
+    await bot.add_cog(Voice(bot))

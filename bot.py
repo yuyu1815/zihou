@@ -57,6 +57,7 @@ intents.presences = True
 """
 
 intents = discord.Intents.default()
+intents.message_content = True
 
 """
 Uncomment this if you want to use prefix (normal) commands.
@@ -193,6 +194,12 @@ class DiscordBot(commands.Bot):
         self.logger.info("-------------------")
         await self.init_db()
         await self.load_cogs()
+        # Sync application (slash) commands so newly added hybrid commands appear
+        try:
+            synced = await self.tree.sync()
+            self.logger.info(f"Synced {len(synced)} application commands (global)")
+        except Exception as e:
+            self.logger.error(f"Failed to sync application commands: {e}")
         self.status_task.start()
         self.database = DatabaseManager(
             connection=await aiosqlite.connect(
