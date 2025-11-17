@@ -1,5 +1,13 @@
 # Updates List
 
+### Version 0.1.0 (17 November 2025)
+
+- Project adaptation for hourly chime bot
+  - Added VC join/leave commands: `/start`, `/stop`
+  - Implemented hourly chime using `audio/1.mp3`–`audio/24.mp3` (0:00 uses `24.mp3`)
+  - Does not auto-move between voice channels by design
+  - Added English `README.md` and Japanese `README_JP.md`
+
 Here is the list of all the updates that I made on this template.
 
 ### Version 6.4.0 (12 September 2025)
