@@ -20,6 +20,7 @@ from discord.ext.commands import Context
 
 
 AUDIO_DIR = Path(__file__).resolve().parent.parent / "audio"
+JIHOU_FILE = AUDIO_DIR / "時報.mp3"
 
 
 class Voice(commands.Cog, name="voice"):
@@ -36,6 +37,34 @@ class Voice(commands.Cog, name="voice"):
             task.cancel()
         for task in self._oneshot_tasks.values():
             task.cancel()
+
+    async def _play_sequence(self, voice_client: discord.VoiceClient, paths: list[Path]) -> bool:
+        """指定された複数の音声ファイルを順番に再生する。
+        - 1つ以上再生できた場合 True を返す。
+        - すべて存在しない/失敗した場合は False。
+        - 例外はログに記録し、次のトラックに進む。
+        """
+        played_any = False
+        for p in paths:
+            if not p.exists():
+                # ファイルがない場合はスキップ
+                self.bot.logger.warning(self._fmt_missing(p))
+                continue
+            try:
+                # もしまだ何か再生中なら待つ
+                while voice_client.is_playing() or voice_client.is_paused():
+                    await asyncio.sleep(0.2)
+                source = discord.FFmpegPCMAudio(str(p))
+                voice_client.play(source)
+                played_any = True
+                # 再生が終わるまで待機
+                while voice_client.is_playing():
+                    await asyncio.sleep(0.2)
+            except Exception as e:
+                self.bot.logger.error(f"音声再生に失敗しました ({p.name}): {e}")
+                # 失敗したら次のトラックへ
+                continue
+        return played_any
 
     @staticmethod
     def _hour_to_filename(hour: int) -> str:
@@ -78,27 +107,14 @@ class Voice(commands.Cog, name="voice"):
             hour = datetime.now().hour
             filename = self._hour_to_filename(hour)
             path = AUDIO_DIR / filename
-            if not path.exists():
-                # 一度だけ通知しやすいようにログに出す
-                self.bot.logger.warning(self._fmt_missing(path))
+
+            # 時報(共通) + 時間の順で再生
+            played = await self._play_sequence(voice_client, [JIHOU_FILE, path])
+            if not played:
+                # どちらも再生できなかった場合は一度だけ警告
+                if not JIHOU_FILE.exists() and not path.exists():
+                    self.bot.logger.warning(self._fmt_missing(path))
                 continue
-
-            # FFmpeg が必要。インストール/パス設定がないと失敗する点に注意
-            try:
-                source = discord.FFmpegPCMAudio(str(path))
-            except Exception as e:
-                self.bot.logger.error(f"FFmpeg 初期化に失敗しました: {e}")
-                raise
-
-            try:
-                voice_client.play(source)
-            except Exception as e:
-                self.bot.logger.error(f"音声再生に失敗しました: {e}")
-                raise
-
-            # 再生完了まで短い間隔で待機
-            while voice_client.is_playing():
-                await asyncio.sleep(0.5)
 
 
     def _ensure_hourly_task(self, guild_id: int) -> None:
@@ -144,52 +160,23 @@ class Voice(commands.Cog, name="voice"):
             hour = datetime.now().hour  # 正時になっている想定
             filename = self._hour_to_filename(hour)
             path = AUDIO_DIR / filename
-            if not path.exists():
-                self.bot.logger.warning(self._fmt_missing(path))
-                if notify_channel_id:
-                    channel = self.bot.get_channel(notify_channel_id)
-                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                        try:
-                            await channel.send(self._fmt_missing(path))
-                        except Exception:
-                            pass
-                return
 
-            try:
-                source = discord.FFmpegPCMAudio(str(path))
-            except Exception as e:
-                self.bot.logger.error(f"FFmpeg 初期化に失敗しました: {e}")
-                if notify_channel_id:
-                    channel = self.bot.get_channel(notify_channel_id)
-                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                        try:
-                            await channel.send(f"FFmpeg 初期化に失敗しました: {e}")
-                        except Exception:
-                            pass
-                return
-
-            try:
-                voice_client.play(source)
-                if notify_channel_id:
-                    channel = self.bot.get_channel(notify_channel_id)
-                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                        try:
+            # 時報(共通) + 時間の順で再生
+            played = await self._play_sequence(voice_client, [JIHOU_FILE, path])
+            if notify_channel_id:
+                channel = self.bot.get_channel(notify_channel_id)
+                if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    try:
+                        if played:
                             await channel.send(f"{hour}時の時報を再生します。")
-                        except Exception:
-                            pass
-            except Exception as e:
-                self.bot.logger.error(f"音声再生に失敗しました: {e}")
-                if notify_channel_id:
-                    channel = self.bot.get_channel(notify_channel_id)
-                    if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                        try:
-                            await channel.send(f"音声再生に失敗しました: {e}")
-                        except Exception:
-                            pass
-                return
-
-            while voice_client.is_playing():
-                await asyncio.sleep(0.5)
+                        else:
+                            # どちらも再生できなかった場合
+                            if not JIHOU_FILE.exists() and not path.exists():
+                                await channel.send(self._fmt_missing(path))
+                            else:
+                                await channel.send("音声再生に失敗しました。FFmpeg の導入やファイルの存在を確認してください。")
+                    except Exception:
+                        pass
         finally:
             # タスク終了時にクリア
             self._oneshot_tasks.pop(guild_id, None)
@@ -208,7 +195,7 @@ class Voice(commands.Cog, name="voice"):
         Join the voice channel the user is currently in.
         - If already connected in this guild to a different channel, do not move.
         - Requires the bot to have Connect and (ideally) Speak permissions.
-        - 参加中は毎正時に `audio/1.mp3 ～ 24.mp3` の対応ファイルを再生します。
+        - 参加中は毎正時に `audio/時報.mp3` の後に、対応する `audio/0.wav ～ 23.wav` を再生します。
         """
         author = ctx.author
         if not isinstance(author, (discord.Member,)):
@@ -296,22 +283,25 @@ class Voice(commands.Cog, name="voice"):
             await ctx.send("ボイスチャンネルへの接続に失敗しました。")
             return
 
-        # Determine next hour and audio file
+        # Determine next hour and audio files (時報 + 時間)
         now = datetime.now()
         next_hour = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).hour
         filename = self._hour_to_filename(next_hour)
         path = AUDIO_DIR / filename
-        if not path.exists():
-            await ctx.send(self._fmt_missing(path))
-            return
 
-        # Stop current playback if any, then play immediately
+        # Stop current playback if any, then play the sequence immediately
         try:
             if voice_client.is_playing() or voice_client.is_paused():
                 voice_client.stop()
-            source = discord.FFmpegPCMAudio(str(path))
-            voice_client.play(source)
-            await ctx.send(f"{next_hour}時の時報を再生します。ファイル: `{filename}`")
+            played = await self._play_sequence(voice_client, [JIHOU_FILE, path])
+            if played:
+                await ctx.send(f"{next_hour}時の時報を再生します。（順番: 時報 → {filename}）")
+            else:
+                # どちらも再生不可
+                if not JIHOU_FILE.exists() and not path.exists():
+                    await ctx.send(self._fmt_missing(path))
+                else:
+                    await ctx.send("音声再生に失敗しました。FFmpeg の導入やファイルの存在を確認してください。")
         except Exception as e:
             await ctx.send(f"音声再生に失敗しました: {e}")
             self.bot.logger.error(f"test: 音声再生に失敗: {e}")
